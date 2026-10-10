@@ -1293,6 +1293,7 @@ const profileDisplayName = (profile) =>
 /** Add one agent per reachable Hermes profile listed in HERMES_PROFILES. */
 async function registerProfileAgents() {
   for (const profile of HERMES_PROFILES) {
+    if (agentRegistry.has(`profile-${profile}`)) continue;
     try {
       const res = await hermesGet("/v1/models", profile);
       res.resume();
@@ -1320,3 +1321,16 @@ async function registerProfileAgents() {
 
 loadHistoryFromDisk();
 registerProfileAgents().finally(startAdapter);
+
+// The gateway may come up after the adapter (or restart); keep retrying the
+// profiles that did not answer yet so they appear without restarting Hermes3D.
+if (HERMES_PROFILES.length > 0) {
+  const retry = setInterval(() => {
+    if (HERMES_PROFILES.every((p) => agentRegistry.has(`profile-${p}`))) {
+      clearInterval(retry);
+      return;
+    }
+    registerProfileAgents().catch(() => {});
+  }, 60_000);
+  retry.unref();
+}
