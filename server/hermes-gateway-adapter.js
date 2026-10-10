@@ -61,6 +61,14 @@ const HERMES_API_KEY = process.env.HERMES_API_KEY || "";
 const ADAPTER_PORT = parseInt(process.env.HERMES_ADAPTER_PORT || "18789", 10);
 const HERMES_MODEL = process.env.HERMES_MODEL || "hermes";
 const HERMES_AGENT_NAME = process.env.HERMES_AGENT_NAME || "Hermes";
+// Hermes profiles shown as their own agents (comma-separated, e.g.
+// "executor,qa"). Each one talks to the gateway's per-profile API at
+// /p/<profile>/v1, so it answers with that profile's SOUL, skills and rules.
+const HERMES_PROFILES = String(process.env.HERMES_PROFILES || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => /^[a-z0-9][a-z0-9_-]*$/i.test(s));
+const profilePrefix = (profile) => (profile ? `/p/${encodeURIComponent(profile)}` : "");
 const HOME = process.env.HOME || "/tmp";
 
 const AGENT_ID = "hermes";
@@ -305,9 +313,9 @@ function redactSecrets(value) {
 // Hermes HTTP API helpers
 // ---------------------------------------------------------------------------
 
-function hermesPost(path, body) {
+function hermesPost(path, body, profile) {
   return new Promise((resolve, reject) => {
-    const urlStr = HERMES_API_URL + path;
+    const urlStr = HERMES_API_URL + profilePrefix(profile) + path;
     let url;
     try { url = new URL(urlStr); } catch { reject(new Error(`Invalid URL: ${urlStr}`)); return; }
     const transport = url.protocol === "https:" ? https : http;
@@ -325,9 +333,9 @@ function hermesPost(path, body) {
   });
 }
 
-function hermesGet(path) {
+function hermesGet(path, profile) {
   return new Promise((resolve, reject) => {
-    const urlStr = HERMES_API_URL + path;
+    const urlStr = HERMES_API_URL + profilePrefix(profile) + path;
     let url;
     try { url = new URL(urlStr); } catch { reject(new Error(`Invalid URL: ${urlStr}`)); return; }
     const transport = url.protocol === "https:" ? https : http;
@@ -368,15 +376,16 @@ function extractOpenAiStyleError(payload, fallbackMessage) {
   return fallbackMessage;
 }
 
-let cachedHermesModels = null;
-let cachedHermesModelsAt = 0;
+/** @type {Map<string, { models: string[], at: number }>} keyed by profile ("" = default) */
+const cachedHermesModels = new Map();
 
-async function fetchHermesModels() {
+async function fetchHermesModels(profile) {
   const now = Date.now();
-  if (cachedHermesModels && now - cachedHermesModelsAt < 30_000) {
-    return cachedHermesModels;
+  const cached = cachedHermesModels.get(profile || "");
+  if (cached && now - cached.at < 30_000) {
+    return cached.models;
   }
-  const res = await hermesGet("/v1/models");
+  const res = await hermesGet("/v1/models", profile);
   if (res.statusCode >= 400) {
     res.resume();
     throw new Error(`Hermes models API HTTP ${res.statusCode}`);
@@ -387,16 +396,15 @@ async function fetchHermesModels() {
         .map((entry) => (typeof entry?.id === "string" ? entry.id.trim() : ""))
         .filter(Boolean)
     : [];
-  cachedHermesModels = models;
-  cachedHermesModelsAt = now;
+  cachedHermesModels.set(profile || "", { models, at: now });
   return models;
 }
 
-async function resolveHermesModel(requestedModel) {
+async function resolveHermesModel(requestedModel, profile) {
   const trimmed = typeof requestedModel === "string" ? requestedModel.trim() : "";
   const normalized = trimmed.includes("/") ? trimmed.split("/").pop().trim() : trimmed;
   try {
-    const models = await fetchHermesModels();
+    const models = await fetchHermesModels(profile);
     if (models.length === 0) {
       return normalized || trimmed || HERMES_MODEL;
     }
@@ -417,14 +425,14 @@ async function resolveHermesModel(requestedModel) {
   }
 }
 
-async function completeOneTurn(messages, model, tools) {
-  const resolvedModel = await resolveHermesModel(model);
+async function completeOneTurn(messages, model, tools, profile) {
+  const resolvedModel = await resolveHermesModel(model, profile);
   const body = { model: resolvedModel, messages, stream: false };
   if (tools && tools.length > 0) {
     body.tools = tools;
     body.tool_choice = "auto";
   }
-  const res = await hermesPost("/v1/chat/completions", body);
+  const res = await hermesPost("/v1/chat/completions", body, profile);
   const payload = await readJsonBody(res);
   if (res.statusCode >= 400) {
     throw new Error(
@@ -474,13 +482,13 @@ async function completeOneTurn(messages, model, tools) {
  * Stream one LLM turn.
  * @returns {{ textContent: string, toolCalls: Array<{id,name,args}>, finishReason: string }}
  */
-async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck) {
+async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck, profile) {
   const body = { model, messages, stream: true };
   if (tools && tools.length > 0) { body.tools = tools; body.tool_choice = "auto"; }
 
-  const resolvedModel = await resolveHermesModel(model);
+  const resolvedModel = await resolveHermesModel(model, profile);
   body.model = resolvedModel;
-  const res = await hermesPost("/v1/chat/completions", body);
+  const res = await hermesPost("/v1/chat/completions", body, profile);
   if (res.statusCode >= 400) {
     res.resume();
     throw new Error(`Hermes API HTTP ${res.statusCode}`);
@@ -539,7 +547,7 @@ async function streamOneTurn(messages, model, tools, onTextDelta, abortCheck) {
   });
 
   if (!textContent.trim() && toolCalls.length === 0 && finishReason === "stop") {
-    const fallback = await completeOneTurn(messages, resolvedModel, tools);
+    const fallback = await completeOneTurn(messages, resolvedModel, tools, profile);
     return {
       textContent: fallback.textContent,
       toolCalls: fallback.toolCalls,
@@ -634,7 +642,7 @@ async function execDelegateTask(args) {
     const result = await streamOneTurn(messages, model, [], (partial) => {
       responseText = partial;
       emitSub("delta", { message: { role: "assistant", content: partial } });
-    }, null);
+    }, null, agent.profile);
     responseText = result.textContent;
 
     // Persist to sub-agent history
@@ -769,7 +777,7 @@ async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, 
   while (round < MAX_TOOL_ROUNDS) {
     round++;
     const { textContent, toolCalls, finishReason } = await streamOneTurn(
-      messages, model, tools, emitDelta, abortCheck
+      messages, model, tools, emitDelta, abortCheck, agent?.profile
     );
 
     if (finishReason === "tool_calls" && toolCalls.length > 0) {
@@ -1275,5 +1283,40 @@ function startAdapter() {
   });
 }
 
+// Words that keep a fixed casing in profile display names.
+const PROFILE_WORD_CASING = { qa: "QA", appsec: "AppSec", ai: "AI", api: "API", ceo: "CEO", devops: "DevOps" };
+const profileDisplayName = (profile) =>
+  profile.split(/[-_]/).filter(Boolean)
+    .map((w) => PROFILE_WORD_CASING[w.toLowerCase()] || w[0].toUpperCase() + w.slice(1))
+    .join(" ");
+
+/** Add one agent per reachable Hermes profile listed in HERMES_PROFILES. */
+async function registerProfileAgents() {
+  for (const profile of HERMES_PROFILES) {
+    try {
+      const res = await hermesGet("/v1/models", profile);
+      res.resume();
+      if (res.statusCode >= 400) {
+        console.error(`[hermes-adapter] Profile "${profile}" skipped: HTTP ${res.statusCode}`);
+        continue;
+      }
+    } catch (err) {
+      console.error(`[hermes-adapter] Profile "${profile}" skipped:`, sanitizeErrorMessage(err));
+      continue;
+    }
+    const id = `profile-${profile}`;
+    agentRegistry.set(id, {
+      id,
+      name: profileDisplayName(profile),
+      workspace: `${HOME}/.hermes/workspace-${profile}`,
+      role: "Hermes profile",
+      profile,
+      // No adapter system prompt: the profile's own SOUL applies server-side.
+      settings: { wipe: false, continuity: true, model: HERMES_MODEL },
+    });
+    console.log(`[hermes-adapter] ✓ Profile agent: ${profile}`);
+  }
+}
+
 loadHistoryFromDisk();
-startAdapter();
+registerProfileAgents().finally(startAdapter);
