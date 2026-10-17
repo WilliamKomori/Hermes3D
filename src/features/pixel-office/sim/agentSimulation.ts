@@ -30,6 +30,26 @@ export type PixelSimulation = {
 
 export const JANITOR_ID = "npc-janitor";
 
+// Rikuchan layout by area: each role's preferred desk, grouped into the map's existing pods
+// (pod A = Engenharia, pod B = Produto/Liderança, CX pod = Growth). Agent ids are
+// "profile-<hermes profile slug>" per the gateway adapter's registerProfileAgents(). Any
+// agent not listed here (a non-Rikuchan roster, or a future role) falls back to "first free
+// desk" exactly as before — this mapping is additive, never a hard requirement.
+const PREFERRED_DESK_BY_AGENT_ID: Record<string, string> = {
+  // Engenharia (pod A).
+  "profile-rik-executor": "desk-a1",
+  "profile-rik-qa": "desk-a2",
+  "profile-rik-appsec": "desk-a3",
+  "profile-rik-plataforma": "desk-a4",
+  // Produto / liderança (pod B).
+  "profile-rik-produto": "desk-b1",
+  "profile-rik-metricas": "desk-b2",
+  "profile-rik-chefe-de-escritorio": "desk-b3",
+  // Growth (pod CX).
+  "profile-rik-marca": "desk-cx1",
+  "profile-rik-cs": "desk-cx2",
+};
+
 // Walking speeds in world pixels per second (~5.6 and ~4.4 tiles/s).
 const AGENT_SPEED = 180;
 const JANITOR_SPEED = 140;
@@ -503,12 +523,18 @@ export const createPixelSimulation = (map: PixelOfficeMap): PixelSimulation => {
       }
     }
 
-    // Sticky desk assignment: first free desk in map order, agents by id.
+    // Sticky desk assignment: each agent's preferred desk (grouped by business area) if free,
+    // else the first free desk in map order. Agents with no preference fall back to "first
+    // free" exactly as before, so non-Rikuchan rosters keep the original behavior.
     for (const input of sortedInputs) {
       if (input.status !== "working" && input.status !== "error") continue;
       if (state.deskByAgentId[input.id]) continue;
       const used = new Set(Object.values(state.deskByAgentId));
-      const freeDesk = map.desks.find((deskSlot) => !used.has(deskSlot.id));
+      const preferredId = PREFERRED_DESK_BY_AGENT_ID[input.id];
+      const preferredDesk = preferredId
+        ? map.desks.find((deskSlot) => deskSlot.id === preferredId && !used.has(deskSlot.id))
+        : undefined;
+      const freeDesk = preferredDesk ?? map.desks.find((deskSlot) => !used.has(deskSlot.id));
       if (freeDesk) state.deskByAgentId[input.id] = freeDesk.id;
     }
 
